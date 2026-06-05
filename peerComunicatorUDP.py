@@ -4,9 +4,8 @@ import threading
 import random
 import time
 import pickle
-from requests import get
-import constMP as Config
 from cards import valores
+from namingClient import NamingClient, get_advertised_host
 
 class PeerCommunicator:
     def __init__(self):
@@ -16,17 +15,21 @@ class PeerCommunicator:
         self.placar = None
 
         self.peer_id = None
+        self.peer_name = None
         self.num_messages = 0
         self.peers = []
+        self.group_manager_addr = None
+        self.naming_client = NamingClient()
 
         self.send_socket = socket(AF_INET, SOCK_DGRAM)
         self.recv_socket = socket(AF_INET, SOCK_DGRAM)
         self.recv_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.recv_socket.bind(('0.0.0.0', Config.PEER_UDP_PORT))
+        self.recv_socket.bind(('0.0.0.0', 0))
+        self.udp_port = self.recv_socket.getsockname()[1]
 
         self.server_socket = socket(AF_INET, SOCK_STREAM)
         self.server_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.server_socket.bind(('0.0.0.0', Config.PEER_TCP_PORT))
+        self.server_socket.bind(('0.0.0.0', 0))
         self.server_socket.listen(1)
 
     def new_game_state(self):
@@ -44,13 +47,22 @@ class PeerCommunicator:
         }
 
     def get_public_ip(self):
-        return get('https://api.ipify.org').content.decode('utf8')
+        return get_advertised_host()
+
+    def lookup_group_manager(self):
+        response = self.naming_client.lookup("group-manager")
+        if response.get("status") != "ok":
+            raise RuntimeError(f"GroupManager nao encontrado: {response.get('message')}")
+
+        address = response["address"]
+        self.group_manager_addr = (address["host"], int(address["port"]))
+        return self.group_manager_addr
 
     def register_with_group_manager(self):
         response = self.send_request({
             "op": "register", 
             "ipaddr": self.get_public_ip(), 
-            "port": Config.PEER_UDP_PORT
+            "port": self.udp_port
         })
         if response.get("status") == 'error':
             print(response.get("message"))
@@ -58,6 +70,18 @@ class PeerCommunicator:
 
         self.peer_id = response["player_id"]
         print(f"Registrado como jogador {self.peer_id}")
+        self.register_with_naming_service()
+
+    def register_with_naming_service(self):
+        self.peer_name = f"peer-{self.peer_id}"
+        address = {
+            "host": self.get_public_ip(),
+            "port": self.udp_port,
+        }
+        response = self.naming_client.rebind(self.peer_name, address, "peer")
+        if response.get("status") != "ok":
+            raise RuntimeError(f"Erro ao registrar peer no NamingService: {response.get('message')}")
+        print(f"Peer registrado no NamingService: {self.peer_name} -> {address}")
 
     def get_table_info(self):
         response = self.send_request({"op": "table"})
@@ -70,11 +94,24 @@ class PeerCommunicator:
         return response["cards"]
 
     def get_list_of_peers(self):
-        self.peers = self.send_request({"op": "list"})
-        # remove self IP if present
-        my_ip = self.get_public_ip()
-        self.peers = [p for p in self.peers if p != my_ip]
-        return self.peers
+        for _ in range(30):
+            response = self.naming_client.discover("peer")
+            if response.get("status") != "ok":
+                raise RuntimeError(f"Erro ao descobrir peers: {response.get('message')}")
+
+            records = response.get("records", [])
+            if len(records) >= 4:
+                self.peers = [
+                    (record["address"]["host"], int(record["address"]["port"]))
+                    for record in records
+                    if record["name"] != self.peer_name
+                ]
+                return self.peers
+
+            print("Aguardando peers no NamingService...")
+            time.sleep(1)
+
+        raise RuntimeError("Timeout aguardando 4 peers no NamingService")
 
     def wait_to_start(self):
         conn, _ = self.server_socket.accept()
@@ -87,19 +124,19 @@ class PeerCommunicator:
     def send_handshakes(self):
         for addr in self.peers:
             msg_pack = pickle.dumps(('READY', self.peer_id))
-            self.send_socket.sendto(msg_pack, (addr, Config.PEER_UDP_PORT))
+            self.send_socket.sendto(msg_pack, addr)
 
     def send_messages(self):
         for msg_number in range(self.num_messages):
             time.sleep(random.uniform(0.01, 0.1))
             msg_pack = pickle.dumps((self.peer_id, msg_number))
             for addr in self.peers:
-                self.send_socket.sendto(msg_pack, (addr, Config.PEER_UDP_PORT))
+                self.send_socket.sendto(msg_pack, addr)
 
     def send_stop_signal(self):
         msg_pack = pickle.dumps((-1, -1))
         for addr in self.peers:
-            self.send_socket.sendto(msg_pack, (addr, Config.PEER_UDP_PORT))
+            self.send_socket.sendto(msg_pack, addr)
 
     def getParceiro(self, teams):
         me = self.peer_id
@@ -124,7 +161,7 @@ class PeerCommunicator:
     def multicast_msg(self, msg):
         msg_pack = pickle.dumps(msg)
         for addr in self.peers:
-            self.send_socket.sendto(msg_pack, (addr, Config.PEER_UDP_PORT))
+            self.send_socket.sendto(msg_pack, addr)
 
     def clear_screen(self):
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -276,8 +313,11 @@ class PeerCommunicator:
         return self.send_request({"op": "register_win", "player_id": self.peer_id, "winner_team": winner, "valor_mao": self.game_state["valor_mao"]})
     
     def send_request(self, request):
+        if not self.group_manager_addr:
+            self.lookup_group_manager()
+
         client_socket = socket(AF_INET, SOCK_STREAM)
-        client_socket.connect((Config.GROUPMNGR_ADDR, Config.GROUPMNGR_TCP_PORT))
+        client_socket.connect(self.group_manager_addr)
         client_socket.send(pickle.dumps(request))
         response = pickle.loads(client_socket.recv(2048))
         client_socket.close()
